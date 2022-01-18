@@ -1,0 +1,9 @@
+<!doctype html>
+<html>
+  <head>
+    <title>This is my webpage!</title>
+  </head>
+  <body>
+    <p>I really don't like html, but I don't want to make a preprocessor just for this nonsense.</p>
+  </body>
+</html>
