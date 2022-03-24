@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="Luis Reyes">
+<title>What's an Entity System?</title></head>
+
+<div class="navbar">
+	<a href="index.html">Home</a>
+	<a href="about_me.html">About Me</a>
+</div>
+
+<body>
+	<h1>Room Based Entity System</h1>
+	<p>These days everyone talks about Entity Component Systems (ECS) as the "thing to do" when it comes to entity systems. But as someone who cares about "how"s and "why"s of a system's implementation, I wanted to do it my own way.</p>
+	<p>So what is an entity system? Well it's a system for managing entities, duh! A better question is "What is an entity?" and once we have a clearer understanding of their requirements, we can better reason how to represent them and manage them.
+	Different games will have different requirements for what an entity is but gernally entities are a general-purpose piece of data for representing parts of a game world. They are used to represent the player, or the slime monster, or the clouds, trees, moving platforms, or anything really!</p>
+	<p>I know what you're thinking: "Well geez, if they're very general-purpose, then what requirements can we use to design the system for managing them?" Yeah, yeah I know... But like I said each game will have different requirements but generally you want to have something like this:</p>
+	
+	<pre class="code">
+	Entity *create_player(Vector2 pos, ...); 
+	Entity *create_slime_monster(Vector2i tile_pos, ...);
+	Entity *find_entity_with_id(u64 entity_id); //us id handles over pointers if entities move around memory
+	void update_entity(Entity *entity); //called per frame, typically gameplay logic
+	Move_Result move_entity(Entity *entity, Vector2 offset_this_frame, Vector2 velocity_change_this_frame);
+	void on_entity_begin_overlap(Entity *entity1, Entity *entity2);
+	void while_entities_overlapping_update(Entity *entity1, Entity *entity2); //not all engines (i.e. Unreal) have this
+	void on_entitiy_end_overlap(Entity *entity1, Entity *entity2);
+	void remove_entity(Entity *);
+	void draw_entity(Entity *);
+	</pre>
+	
+	<p>Very broadly what a game does is create entities of different types. We then loop through all entities and call update_entity() every frame, where most of the gameplay logic takes place--stuff like using input to move the player, or an enemy deciding where to move to. But really anything that needs to happen, happens in update_entity(). From within update_entity(), we often call move_entity() to change the entities position. Here we do collision checking to see if the entity will hit walls or other entities. on_entity_begin_overlap() and on_entity_exit_overlap() are called from within move_entity() and more gameplay logic lies in there. Finally we draw the entity to the screen and we of course call remove_entity() when an entity dies or has served its purpose. My game has this as well as these other routines:
+	
+	<pre class="code">
+	void damage_entity(Entity *entity, int num_hitpoints_to_remove);
+	void heal_entity(Entity *entity, int num_hitpoints_to_add);
+	void entity_eat_food(Entity *eater, Entity *food);
+	</pre>
+	
+	<p>Hmm well these seem a bit more specific, don't they? Does damage_entity() make sense called on a rock entity? Well maybe if this was Minecraft. What about calling heal_entity() on the sky entity? What about entity_eat_food(rock, sky) ...? At this point, the first thing to do is just make a bunch of flags that dictate which entity types make sense where. However, once the entity struct starts getting larger in order to support all these other entity-sub-type routines, people start to worry and want to make a more complicated and dynamic Entity struct. This is where many people break into two camps--either they make an ECS or a classical object-oriented spaghetti hell hierarchy.</p>
+	
+	<p>ECS bascially says lets represent the entity as a collection of components. Depending on what components an entity has, certain operations/logic occur. For example, an entity could have a "health point" component, and only entities with that component will be affected by damage_entity() and heal_entity(). You can have a "hunger point" component and a "Nutritional Value" component ... and you get the idea. You may not even need a notion of an entity type anymore and can just rely on entities having and not having certain components decide what codepaths to take.</p>
+	
+	<p>Let me tell you why this is bad and why I didn't even consider this approach. I care about performance. These days, achieving performance boils down to cache coherency (keeping the data you need in the cache as much as possible). CPUs are fast and although writing a SIMD-wide, multithreaded, brachless, lockless routine may speed up performance, you will still be very slow if the data you're operating on is all over the place. <i>ECS will be slow if the components you're processing need to constantly be pulled into the cache!</i> ECS is a form of premature optimization. Up front, one has to delcare what data you think you will need in each component. It baffles me everytime I see someone online write something like this in their ECS-based game:</p>
+	
+	<pre class="code">
+	struct Entity {
+		ECS_Component&lt;Vector3&gt; position;
+		ECS_Component&lt;Vector3&gt; velocity;
+		...
+	};
+	</pre>
+	
+	<p>Like c'mon bro, you don't think when you're moving the entity that you'll need to know it's current velocity and current position to determine where you want to move to?!? Imagine how slow it'll be if each ECS component type is stored in it's own array and you constantly have to poke different parts of memory to make a simple calculation? Hopefully each component is stored in an array and you're not just calling malloc() and free() all the time... How big is an ECS_Component anyways? Just store position and velocity directly in there!</p>
+	
+	<p>"But if I store both, how do I handle entities that don't move?" Store a ENTITY_WILL_NEVER_MOVE flag into the entity and move on with your life. If an entity for some reason doesn't need a position, store it anyways and just never touch that member!</p>
+	
+	<p>I won't even comment on the OOP approach. It's 2022, everyone should know better by now. Try it for yourself and suffer.</p>
+	
+	<p>"So is the solution really to have a big struct and store bit flags? That's crazy!" Well on PC and consoles, memory is pretty cheap so it's really not that crazy. Of course if entities are really huge, touching entities in different memory regions would be slow. But bulk processing as in looping through all entities to call update_entity() on them will be fast since all the memory that an entity will need will be there. Besides parallel computing, the best way to achieve performance is simply to store all the data to-be-processed in an array, and loop through it. ECS seems like it's adhering to this but you have to pressume what data needs to be compartmentalized together early in development. Games are complicated and what an entity type needs at a given time changes throughout the development process. If you're not careful, you can easily end up in this nasty situation where you have to keep making new components to support new/changed features and constantly pull different components together into memory ... and ugghhh... slow ...</p>
+	
+	<p>ECS isn't bad; it's just a hot programming topic some people jump into implementing right away for no solid reason. You have to have a good reason before breaking things up into components. Recently I did something ECS-like. My move_entity() call was running slow as I cranked up the entity count to a number I required for the game. This makes sense since collision detection is an O(n^2) problem, meaning it takes an exponentially amount of computing power to run as the entity count increases linearly. My entities used to look like this.</p>
+	
+	<pre class="code">
+	struct Entity {
+	    Vector2 pos;
+	    Vector2 vel;
+	    int collider_count;
+	    Collider colliders[MAX_COLLIDER_COUNT];
+		...
+	};
+	</pre>
+	
+	<p>And move entity looked like this:</p>
+	
+	<pre class="code">
+	move_entity(Entity *entity, Vector2 offset) {
+	    foreach Collider ent_col in entity
+	        foreach Entity other in world_entity_array
+	           foreach Collider oth_col in other
+	               ...
+	               check_if_will_collide_and_handle_gameplay_logic(entity, ent_col, other, oth_col);
+	               ...	
+	}
+	</pre>
+	
+	<p>I then realized that the only data I really needed to determine if entities will collide is their colliders already resolved in world space (I used to store them local to the entity's position). So I pulled the colliders out of the entity struct and put them into a giant array. Entities can now register and unregister colliders when needed and we just iterate through all the colliders to determine what entities we hit. The colliders store a back pointer to the entity so once we have found a hit, we then process the entity and poke it's memory. Already this method is a lot faster and I have not even built a spatial parition yet...</p>
+	
+	<p>Would have a Collider ECS component prevented this problem? Well maybe but then how would I store multiple colliders per entity? I would then have to make a ECS Collider Array component and I likewise have to restructure my code. The code will change as the requirements for the game changes. That's just how it goes. ECS makes writing code more restrictive as you're pre-bundling data togehter. If you just store everything in the entity struct first, you have the flexibility to experiement more freely and once you have a better understanding of what you want, then you can optimize in an ECS-like way. How to conclude?...</p>
+	
+	
+</body>
+
+</html>
