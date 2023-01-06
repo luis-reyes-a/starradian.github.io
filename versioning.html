@@ -31,7 +31,7 @@
     };
   </pre>
   <p>Now we have a problem because when I go to load a file with the first version and memcpy things into my new version of Player, "health" will be set correctly, "max_health" will be set with the integer representation of whatever we set "attack_cooldown_t" to. And "attack_cooldown_t" will have a garbage value most likely.</p>
-  <p>I could be smarter and add "max_health" to the end of the struct. That way my original members will be loaded correctly. However, then "attack_cooldown_t" will be loaded with garbage values if we memcpy over more bytes than we had originally saved with the first version of Player. We could then remember what the original size was and ... well we could but we could do something smarter here. More problems will arise as soon as we want to start removing members anyways so clearly we need a better system for handling file format changes.</p>
+  <p>I could be smarter and add "max_health" to the end of the struct. That way my original members will be loaded correctly. However, then "max_health" will be loaded with garbage values if we memcpy over more bytes than we had originally saved with the first version of Player. We could then remember what the original size was and ... well we could but we could do something smarter here. More problems will arise as soon as we want to start removing members anyways so clearly we need a better system for handling file format changes.</p>
   <p>I will show you my simple method for storing file format versions that supports removing and adding member fields as well as loading older file versions.</p>
   
   <h1>Versioning Each Member</h1>
@@ -43,7 +43,7 @@
         f32 attack_cooldown_t; VER(1) //seconds remaining until player can attack again
     };
   </pre>
-  <p>"VER()" is a macro that expands to nothing so compilation isn't affected. It's simply a marker for my custom metaprogram to find and to know what version a struct or struct member is. My metaprogram takes in that versioning information and uses it to generate code like this:</p>
+  <p>"VER()" is a macro that expands to nothing so compilation isn't affected. It's simply a marker for my custom metaprogram to find out what version a struct and it's members are. My metaprogram takes in that versioning information and uses it to generate code like this:</p>
   <pre class="code">
     struct Header {
         s32 version;
@@ -58,43 +58,45 @@
         s32 health;
         s32 max_health;
     };
-    typedef Player_v2 Player;
     
-    static bool load_player(char *filename, Player *dst) {
+    static bool load_player(Player_v2 *dst, char *filename) {
         void *file = open_entire_file(filename);
         if (!file) return false;
         
         Header *header = (Header *)file;
         switch(header->version) {
         case 1: {
-            Player_v1 *v1 = (Player_v1 *)file;
-            upgrade_to_current_version(v1, dst);
+            Player_v1 *v1 = (Player_v1 *)header;
+            upgrade_to_current_version(dst, v1);
             return true;
         } break;
         case 2: {
-            Player_v1 *v2 = (Player_v2 *)file;
-            upgrade_to_current_version(v2, dst);
+            Player_v1 *v2 = (Player_v2 *)header;
+            upgrade_to_current_version(dst, v2);
             return true;
         } break;
         default: return false; //corrupt file most likely
         }
     }
 
-    static void upgrade_to_current_version(Player_v1 *v1, Player *dst) {
+    static void upgrade_to_current_version(Player_v2 *dst, Player_v1 *v1) {
         dst->health = v1->health;
         dst->attack_cooldown_t = v1->attack_cooldown_t;
         dst->max_health = {/*default to zero*/};
     }
-    static void upgrade_to_current_version(Player_v2 *v2, Player *dst) {
-        memcpy(dst, v2, sizeof Player_v2);
+    static void upgrade_to_current_version(Player_v2 *dst, Player_v2 *v2) {
+        dst->health = v2->health;
+        dst->max_health = v2->max_health;
+        dst->attack_cooldown_t = v2->attack_cooldown_t;
     }
   </pre>
-  <p>Suppose now that I had actually wanted to remove attack_cooldown_t on version 2. The markup would look like this:</p>
+  <p>It's easy to generate code like that with the versioning information. We know what version each member belongs to, so the structs are easy to generate. The upgrade routines only have to check if the member exists for both the current and the previous version in order to copy the member over. If the member didn't exist in a previous version, we just zero it out (or we could also parse out a default value to initialize it to in the struct Player declaration).</p>
+  <p>This will also work if we want to remove members from future versions. Suppose that I had actually wanted to remove attack_cooldown_t on version 2. The markup would look like this:</p>
   <pre class="code">
     struct Player VER(2){
         s32 health;            VER(1)
         s32 max_health;        VER(2)
-        f32 attack_cooldown_t; VER(1-1) //removed on version 2
+        f32 attack_cooldown_t; VER(1-1) //member now exists only for struct version between [1, 1]
     };
   </pre>
   <p>The generated Player_v2 and the upgrade routine would look like this:</p>
@@ -103,30 +105,145 @@
       s32 health;
       s32 max_health;   
   };
-  static void upgrade_to_current_version(Player_v1 *v1, Player *dst) {
+  static void upgrade_to_current_version(Player_v2 *dst, Player_v1 *v1) {
         dst->health = v1->health;
         dst->max_health = {/*default to zero*/};
-   }
+  }
   </pre>
 
-  <p>The code to generate the upgrade routines is actually very trivial. You obviously have to store the text for each member variable we will generate as well as the parsed out version number for that member. We loop through the variables and only generate code to upgrade to the current version if that member still exists for that file version. Something like this:</p>
+  <p>The code to generate the upgrade routines is still as trivial. We just now have to store a "version_start" and "version_end" for each member. If no "version_end" was specified for a member (such as with "health" and "max_health"), we just set "version_end" to the current struct version number. If a member no longer exists in the current struct version, we simply have to not generate any code to set that member. My code looks something like this:</p>
   <pre class="code">
-    for (s32 version = 1; version <= file_format->current_version; version += 1) {
-        fprintf(file, "static void upgrade_to_current_version(Player_v%d *old, Player_v%d *dst) {\n", version, file_format->current_version);
-        for (member : file_format->members) {
+    for (s32 version = 1; version <= player->current_version; version += 1) {
+        fprintf(file, "static void upgrade_to_current_version(Player_v%d *dst, Player_v%d *old) {\n", player->current_version, version);
+        for (member : player->members) {
             bool in_old_version     = member->version_start >= version && member->version_end <= version;
-            bool in_current_version = member->version_start >= file_format->current_version && member->version_end <= file_format->current_version;
+            bool in_current_version = member->version_start >= player->current_version && member->version_end <= player->current_version;
             if (in_current_version) {
-                if (in_old_version) {}
-                    fprintf(file, "\tdst->%s = old->%s;\n", member->name, member->name);
-                } else { //this member was added to current version, we simply set it to whatever default value user specified or zero-initialize
+                if (in_old_version) {
+                    //copy value from previous version to current
+                    fprintf(file, "    dst->%s = old->%s;\n", member->name, member->name);
+                } else { 
+                    //this member was added in current version; we simply initialize to zero or to user specified default value
                     char *defval = member->defval ? member->defval : "{/*default to zero*/};"
-                    fprintf(file, "\dst->%s = %s;\n", member->name, defval);
+                    fprintf(file, "    dst->%s = %s;\n", member->name, defval);
                 }
             }
         }
+        fprintf(file, "}\n");
     }
   </pre>  
+
+  <h1>Storing File Formats Within File Formats</h1>
+  <p>Let's backtrack a little and say that struct "Player" actually stores an "Item". And let's say that "Item" is also a struct that changes over time. Will our system work with something like this? </p>
+  <pre class="code">
+    struct Item VER(2) {
+        s32 power; VER(1)
+        s32 hp;    VER(2) // hits until item breaks
+    }
+    struct Player VER(2) {
+        s32 health; VER(1);
+        Item item;  VER(2); 
+    }
+  </pre>
+  <p>Well for Item, things will work as expected but what about for Player? If you think about it, there are really 3 versions of Player: Player_v1_Item_v1, Player_v2_Item_v1, and Player_v2_Item_v2 (assuming Item was updated after Player was updated). And things will only get more complicated if Player has more file formats inside it as we would need to handle every combination of every struct version! Our markup and generation code would have to get more complex but luckily I have a solution that involves using a little indirection.</p>
+
+  <p>What we would do is not allow file format structs inside file format structs. What we do instead is store an offset into the part of the file where that file format is stored. So our generated structs for the case above would look like this:</p>
+  <pre class="code">
+    struct Item_v1 : Header {
+        s32 power;
+    };
+    struct Item_v2 : Header {
+        s32 power;
+        s32 hp;
+    };
+    struct Player_v1 : Header {
+        s32 health;
+    };
+    struct Player_v2 : Header {
+        s32 health;
+        u64 item; // offset to where item is located in the file
+    };
+  </pre>
+
+  <p>What turning the "Item" into an offset allows us to do is to use our load routines for us. We use the offset to load the Item and upgrade it to the current version for us to use. So the struct the user will use is just one with all the current file format versions! The final generation code to create a "Runtime_Player" struct would look like this:</p>
+  <pre class="code">
+    // ...
+    // structs for each version of the file formats and it's upgrade_to_current_version() routines
+    // ...
+    struct Runtime_Item {
+        s32 power;
+        s32 hp;
+    };
+    struct Runtime_Player {
+        s32 health;
+        Runtime_Item item;
+    };
+    static bool load_item(Runtime_Item *dst, void *file, u64 offset) {
+        assert (file);
+        Header *header = (Header *)((u8 *)file + offset);
+        switch(header->version) {
+        case 1: {
+            Item_v1 *v1 = (Item_v1 *)header;
+            upgrade_to_current_version(dst, v1, file);
+            return true;
+        } break;
+        case 2: {
+            Item_v2 *v2 = (Item_v2 *)header;
+            upgrade_to_current_version(dst, v2, file);
+            return true;
+        } break;
+        default: return false; //corrupt file most likely
+        }
+    }
+    
+    static bool load_player(Runtime_Player *dst, void *file, u64 offset) {
+        assert (file);
+
+        Header *header = (Header *)((u8 *)file + offset);
+        switch(header->version) {
+        case 1: {
+            Player_v1 *v1 = (Player_v1 *)header;
+            upgrade_to_current_version(dst, v1, file);
+            return true;
+        } break;
+        case 2: {
+            Player_v2 *v2 = (Player_v2 *)header;
+            upgrade_to_current_version(dst, v2, file);
+            return true;
+        } break;
+        default: return false; //corrupt file most likely
+        }
+    }
+  </pre>
+
+  <p>Notice how our load routines now take in a file pointer and contents instead of a filename. This is important since our upgrade routines will now have to be slightly different. They will still work in the exact same way as before when using primitive types. But for file format structs, we now have to do something a little extra like so:</p>
+  <pre class="code">
+    static void upgrade_current_version(Runtime_Player *dst, Player_v2 *v2, void *file) {
+        dst->health = v2->health;
+        load_item(&dst->item, file, v2->item);
+    }
+  </pre>
+  <p>The same code we use to load file format structs out of a file we can leverage to construct an up-to-date "runtime" version of all the structs we marked up. Isn't that neat!! Not much more code was needed except now we have to check if a member variable is a primitive type or a file format struct.</p>
+  
+  <h1>Conclusion</h1>
+  <p>All in all, this is a neat and simple system to load old file versions into an up-to-date version for our program to use. One caveat is that you want to make sure the struct members for the file format structs are always written in a consistent order. For example, say with my Player struct I reorder the struct members like so:</p>
+  <pre class="code">
+    struct Player VER(1) {
+        s32 health;     VER(1);
+        s32 max_health; VER(1)
+    }
+    // reordered into this:
+    struct Player VER(1) {
+        s32 max_health; VER(1)
+        s32 health;     VER(1);
+    }
+  </pre>
+  <p>If you generate the struct members in the order the user specified them in, data will get written into the incorrect members on load. What I do is I simply sort the members alphabetically by their names to write out the members consistently. This allows us to freely reorder our fields without worry!</p>
+
+  <p>Something this system will not handle is renaming variables. I haven't figured out a way to support this without making the markup more complicated. So for now, if a variable needs to be renamed ... I just dont.</p>
+
+  <p>Anyways, hopefully this gave you a clear idea of how my system works. I'm guessing a lot of developers and studios use a similar technique, however you never see any of that information posted online. I hope this has helped you and thanks for reading!</p>
 </body>
+
 
 </html>
