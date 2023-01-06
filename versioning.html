@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="Luis Reyes">
+<title>File Versioning</title></head>
+
+<div class="navbar">
+	<a href="index.html">Home</a>
+	<a href="about_me.html">About Me</a>
+</div>
+
+<body>
+  <h1>File Versioning</h1>
+  <p>There is surprisingly little information about file versioning and serialization online. What I mean with "versioning" is being able to support older versions of a file on disk even as that file format changes over time. Suppose I have a struct that represents a file format like so:</p>
+
+  
+  <pre class="code">
+    struct Player {
+        s32 health;
+        f32 attack_cooldown_t; //seconds remaining until player can attack again
+    };
+  </pre>
+  <p>And this is great until I want to make a change. Suppose I want to add a "max_health" field so that when I drink a healing potion, I regain my health again. So then I write this:</p>
+  <pre class="code">
+    struct Player {
+        s32 health;
+        s32 max_health;
+        f32 attack_cooldown_t; //seconds remaining until player can attack again
+    };
+  </pre>
+  <p>Now we have a problem because when I go to load a file with the first version and memcpy things into my new version of Player, "health" will be set correctly, "max_health" will be set with the integer representation of whatever we set "attack_cooldown_t" to. And "attack_cooldown_t" will have a garbage value most likely.</p>
+  <p>I could be smarter and add "max_health" to the end of the struct. That way my original members will be loaded correctly. However, then "attack_cooldown_t" will be loaded with garbage values if we memcpy over more bytes than we had originally saved with the first version of Player. We could then remember what the original size was and ... well we could but we could do something smarter here. More problems will arise as soon as we want to start removing members anyways so clearly we need a better system for handling file format changes.</p>
+  <p>I will show you my simple method for storing file format versions that supports removing and adding member fields as well as loading older file versions.</p>
+  
+  <h1>Versioning Each Member</h1>
+  <p>In my code, I do something like this:</p>
+  <pre class="code">
+    struct Player VER(2){
+        s32 health;            VER(1)
+        s32 max_health;        VER(2)
+        f32 attack_cooldown_t; VER(1) //seconds remaining until player can attack again
+    };
+  </pre>
+  <p>"VER()" is a macro that expands to nothing so compilation isn't affected. It's simply a marker for my custom metaprogram to find and to know what version a struct or struct member is. My metaprogram takes in that versioning information and uses it to generate code like this:</p>
+  <pre class="code">
+    struct Header {
+        s32 version;
+        s32 __reserved[15]; //in case we want to add more variables here
+    };
+    struct Player_v1 : Header {
+        f32 attack_cooldown_t;
+        s32 health;
+    };
+    struct Player_v2 : Header {
+        s32 attack_cooldown_t;
+        s32 health;
+        s32 max_health;
+    };
+    typedef Player_v2 Player;
+    
+    static bool load_player(char *filename, Player *dst) {
+        void *file = open_entire_file(filename);
+        if (!file) return false;
+        
+        Header *header = (Header *)file;
+        switch(header->version) {
+        case 1: {
+            Player_v1 *v1 = (Player_v1 *)file;
+            upgrade_to_current_version(v1, dst);
+            return true;
+        } break;
+        case 2: {
+            Player_v1 *v2 = (Player_v2 *)file;
+            upgrade_to_current_version(v2, dst);
+            return true;
+        } break;
+        default: return false; //corrupt file most likely
+        }
+    }
+
+    static void upgrade_to_current_version(Player_v1 *v1, Player *dst) {
+        dst->health = v1->health;
+        dst->attack_cooldown_t = v1->attack_cooldown_t;
+        dst->max_health = {/*default to zero*/};
+    }
+    static void upgrade_to_current_version(Player_v2 *v2, Player *dst) {
+        memcpy(dst, v2, sizeof Player_v2);
+    }
+  </pre>
+  <p>Suppose now that I had actually wanted to remove attack_cooldown_t on version 2. The markup would look like this:</p>
+  <pre class="code">
+    struct Player VER(2){
+        s32 health;            VER(1)
+        s32 max_health;        VER(2)
+        f32 attack_cooldown_t; VER(1-1) //removed on version 2
+    };
+  </pre>
+  <p>The generated Player_v2 and the upgrade routine would look like this:</p>
+  <pre class="code">
+  struct Player_v2 : Header {
+      s32 health;
+      s32 max_health;   
+  };
+  static void upgrade_to_current_version(Player_v1 *v1, Player *dst) {
+        dst->health = v1->health;
+        dst->max_health = {/*default to zero*/};
+   }
+  </pre>
+
+  <p>The code to generate the upgrade routines is actually very trivial. You obviously have to store the text for each member variable we will generate as well as the parsed out version number for that member. We loop through the variables and only generate code to upgrade to the current version if that member still exists for that file version. Something like this:</p>
+  <pre class="code">
+    for (s32 version = 1; version <= file_format->current_version; version += 1) {
+        fprintf(file, "static void upgrade_to_current_version(Player_v%d *old, Player_v%d *dst) {\n", version, file_format->current_version);
+        for (member : file_format->members) {
+            bool in_old_version     = member->version_start >= version && member->version_end <= version;
+            bool in_current_version = member->version_start >= file_format->current_version && member->version_end <= file_format->current_version;
+            if (in_current_version) {
+                if (in_old_version) {}
+                    fprintf(file, "\tdst->%s = old->%s;\n", member->name, member->name);
+                } else { //this member was added to current version, we simply set it to whatever default value user specified or zero-initialize
+                    char *defval = member->defval ? member->defval : "{/*default to zero*/};"
+                    fprintf(file, "\dst->%s = %s;\n", member->name, defval);
+                }
+            }
+        }
+    }
+  </pre>  
+</body>
+
+</html>
